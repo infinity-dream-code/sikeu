@@ -4,10 +4,11 @@ namespace App\Support;
 
 use App\Models\scctbill;
 use Auth;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Str;
+use RuntimeException;
 
 class ManualPaymentBuilder
 {
@@ -25,7 +26,7 @@ class ManualPaymentBuilder
         $aa = (string) $tagihan->AA;
         $billCd = (string) ($tagihan->BILLCD ?? '');
         $userId = $this->resolveCyberKeyUserId();
-        $hostname = Str::limit((string) ($request->ip() ?? ''), 250, '');
+        $paymentDateYmd = Carbon::parse($paidAt)->format('Ymd');
 
         if ($fidBank === self::SALDO_FIDBANK) {
             $this->callBuilderPaymentBill($aa, $nominal);
@@ -34,48 +35,53 @@ class ManualPaymentBuilder
 
         $this->callBuilderPaymentCash(
             $custId,
-            $aa,
-            $billCd,
-            $nominal,
             $fidBank,
             $userId,
-            $hostname
+            $paymentDateYmd,
+            $billCd,
+            $aa,
+            $nominal
         );
     }
 
-    /** BuilderPaymentCash(custid, aa, billcd, nominal, fidbank, users, hostname) */
+    /**
+     * BuilderPaymentCash(v_CUSTID, p_FIDBANK, p_User, p_Date, p_BILLCD, p_AA, p_Payment)
+     * p_Date format: YYYYMMDD
+     */
     private function callBuilderPaymentCash(
         string $custId,
-        string $aa,
-        string $billCd,
-        int $nominal,
         string $fidBank,
         string $userId,
-        string $hostname
+        string $paymentDateYmd,
+        string $billCd,
+        string $aa,
+        int $nominal
     ): void {
         Log::info('manual-payment.builder.call', [
             'function' => 'BuilderPaymentCash',
             'custid' => $custId,
-            'aa' => $aa,
-            'billcd' => $billCd,
-            'nominal' => $nominal,
             'fidbank' => $fidBank,
-            'users' => $userId,
-            'hostname' => $hostname,
+            'user' => $userId,
+            'date' => $paymentDateYmd,
+            'billcd' => $billCd,
+            'aa' => $aa,
+            'payment' => $nominal,
         ]);
 
-        $this->invokeStoredFunction('BuilderPaymentCash', [
+        $result = $this->invokeStoredFunction('BuilderPaymentCash', [
             $custId,
-            $aa,
-            $billCd,
-            $nominal,
             $fidBank,
             $userId,
-            $hostname,
+            $paymentDateYmd,
+            $billCd,
+            $aa,
+            $nominal,
         ]);
+
+        $this->assertOkResult('BuilderPaymentCash', $result);
     }
 
-    /** BuilderPaymentBill(aa, nominal) — 2 param sesuai definition DB */
+    /** BuilderPaymentBill — 2 param (sesuaikan jika definition DB berbeda) */
     private function callBuilderPaymentBill(string $aa, int $nominal): void
     {
         Log::info('manual-payment.builder.call', [
@@ -84,21 +90,48 @@ class ManualPaymentBuilder
             'nominal' => $nominal,
         ]);
 
-        $this->invokeStoredFunction('BuilderPaymentBill', [
+        $result = $this->invokeStoredFunction('BuilderPaymentBill', [
             $aa,
             $nominal,
         ]);
+
+        $this->assertOkResult('BuilderPaymentBill', $result);
     }
 
-    /** MySQL FUNCTION (fx) — pakai SELECT, bukan CALL (procedure). */
-    private function invokeStoredFunction(string $functionName, array $params): void
+    private function invokeStoredFunction(string $functionName, array $params): ?string
     {
         $placeholders = implode(', ', array_fill(0, count($params), '?'));
 
-        DB::connection('DATA_MYSQL')->select(
-            "SELECT {$functionName}({$placeholders})",
+        $rows = DB::connection('DATA_MYSQL')->select(
+            "SELECT {$functionName}({$placeholders}) AS result",
             $params
         );
+
+        return isset($rows[0]) ? (string) ($rows[0]->result ?? '') : null;
+    }
+
+    private function assertOkResult(string $functionName, ?string $result): void
+    {
+        if ($result === 'OK') {
+            return;
+        }
+
+        Log::warning('manual-payment.builder.rejected', [
+            'function' => $functionName,
+            'result' => $result,
+        ]);
+
+        throw new RuntimeException($this->translateBuilderResult($result));
+    }
+
+    private function translateBuilderResult(?string $result): string
+    {
+        return match ($result) {
+            'NOMINAL_SALAH_TAGIHAN_TIDAK_BOLEH_DICICIL' => 'Tagihan tidak boleh dicicil. Nominal harus sama dengan sisa tagihan.',
+            'MELEBIHI_TAGIHAN' => 'Nominal pembayaran melebihi sisa tagihan.',
+            null, '' => 'Function pembayaran tidak mengembalikan hasil.',
+            default => 'Pembayaran ditolak function DB: ' . $result,
+        };
     }
 
     private function resolveCyberKeyUserId(): string
